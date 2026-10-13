@@ -18,18 +18,21 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import sys
+import math
+import time
 from typing import Any, AsyncGenerator, Optional
 
 from agentscope.credential import OpenAICredential
-from agentscope.message import Msg
+from agentscope.message import Msg, TextBlock
 from agentscope.model import ChatResponse, OpenAIChatModel
 from agentscope.tool import ToolChoice
 
 from app.infrastructure.budget import current_tier, get_budget, minimal_mode_hint
 from app.infrastructure.context import ShoppingContext
 from app.infrastructure.eventbus import TradeEventBus
+from app.infrastructure.model_usage import ModelUsageLedger
 from app.infrastructure.settings import Settings
+from app.infrastructure.task_routing import can_use_small_model, current_routing_decision
 from app.infrastructure.throttle import GatewayThrottle
 from app.infrastructure.transient import is_transient_error
 
@@ -37,23 +40,39 @@ logger = logging.getLogger(__name__)
 
 
 class ThrottledChatModel(OpenAIChatModel):
-    """带配额闸门、退避重试与限流回退的 OpenAIChatModel。"""
+    """OpenAI-compatible gateway with bounded calls, retries, and safe fallback."""
 
     def __init__(
         self,
         *,
         throttle: GatewayThrottle,
         fallback: Optional[OpenAIChatModel] = None,
+        small_model: Optional[OpenAIChatModel] = None,
         max_transient_retries: int = 2,
         retry_base_seconds: float = 6.0,
+        request_timeout_seconds: float = 30.0,
+        total_timeout_seconds: float = 90.0,
+        usage_recorder: Optional[ModelUsageLedger] = None,
         bus: Optional[TradeEventBus] = None,
         **kwargs: Any,
     ) -> None:
+        # Retry policy belongs to this gateway so retries, deadlines, and model
+        # promotion share one bounded budget instead of nesting SDK retries.
+        kwargs["max_retries"] = 0
         super().__init__(**kwargs)
+        if not math.isfinite(request_timeout_seconds) or request_timeout_seconds <= 0:
+            raise ValueError("request_timeout_seconds must be a finite positive number")
+        if not math.isfinite(total_timeout_seconds) or total_timeout_seconds <= 0:
+            raise ValueError("total_timeout_seconds must be a finite positive number")
         self._throttle = throttle
         self._fallback = fallback
+        self._small_model = small_model
         self._max_transient_retries = max_transient_retries
         self._retry_base_seconds = retry_base_seconds
+        self._request_timeout_seconds = request_timeout_seconds
+        self._total_timeout_seconds = total_timeout_seconds
+        self._usage_recorder = usage_recorder if usage_recorder is not None else ModelUsageLedger()
+        self.usage_ledger = self._usage_recorder
         self._bus = bus
 
     async def __call__(  # type: ignore[override]
@@ -63,33 +82,178 @@ class ThrottledChatModel(OpenAIChatModel):
         tool_choice: Optional[ToolChoice] = None,
         **kwargs: Any,
     ) -> ChatResponse | AsyncGenerator[ChatResponse, None]:
-        # 手动进出上下文而非 async with：流式分支要把名额移交给包装生成器
-        slot = self._throttle.slot()
-        await slot.__aenter__()
-        try:
-            result = await self._call_with_fallback(messages, tools, tool_choice, **kwargs)
-        except BaseException:
-            await slot.__aexit__(*sys.exc_info())
-            raise
-
+        total_deadline = time.monotonic() + self._total_timeout_seconds
+        result, slot, model_name, request_deadline, retries_left = await self._call_with_fallback(
+            messages,
+            tools,
+            tool_choice,
+            total_deadline=total_deadline,
+            retries=self._max_transient_retries,
+            **kwargs,
+        )
         if not hasattr(result, "__aiter__"):
-            await slot.__aexit__(None, None, None)
-            _charge_budget(result)
+            try:
+                await slot.__aexit__(None, None, None)
+            finally:
+                _charge_budget(result)
+                self._record_usage(result, model_name)
             return result
-        return self._release_after_stream(slot, result)
+        return self._release_after_stream(
+            slot,
+            result,
+            model_name,
+            request_deadline,
+            total_deadline,
+            retries_left,
+            messages,
+            tools,
+            tool_choice,
+            kwargs,
+        )
+
+    async def _release_after_stream(
+        self,
+        slot: Any,
+        stream: Any,
+        model_name: str,
+        request_deadline: float,
+        total_deadline: float,
+        retries_left: int,
+        messages: list[Msg],
+        tools: Optional[list[dict]],
+        tool_choice: Optional[ToolChoice],
+        kwargs: dict[str, Any],
+    ) -> AsyncGenerator[ChatResponse, None]:
+        """Hold a slot through streaming, with retries only before output starts."""
+        active_slot: Any = slot
+        active_stream: Any = stream
+        active_model = model_name
+        active_request_deadline = request_deadline
+        active_retries_left = retries_left
+        last: Any = None
+        attempt_recorded = False
+        try:
+            while True:
+                emitted = False
+                try:
+                    async for chunk in self._timed_stream(
+                        active_stream,
+                        active_request_deadline,
+                        total_deadline,
+                    ):
+                        last = chunk
+                        emitted = True
+                        yield chunk
+                    self._charge_and_record(last, active_model)
+                    attempt_recorded = True
+                    return
+                except BaseException as err:
+                    await self._close_stream(active_stream)
+                    if not attempt_recorded:
+                        self._charge_and_record(last, active_model)
+                        attempt_recorded = True
+                    await active_slot.__aexit__(None, None, None)
+                    active_slot = None
+
+                    # Once any content reached the caller, retrying could splice
+                    # answers from two models into one response.
+                    if not isinstance(err, Exception) or emitted or _is_non_retryable_http_error(err):
+                        raise
+                    if not _is_retryable_gateway_error(err):
+                        raise
+
+                    if active_retries_left > 0:
+                        result, active_slot, active_model, active_request_deadline, active_retries_left = (
+                            await self._call_with_fallback(
+                                messages,
+                                tools,
+                                tool_choice,
+                                total_deadline=total_deadline,
+                                retries=active_retries_left - 1,
+                                **kwargs,
+                            )
+                        )
+                    elif self._configured_route()[0] == "task_small":
+                        result, active_slot, active_model, active_request_deadline, active_retries_left = (
+                            await self._promote_small_to_main(
+                                messages,
+                                tools,
+                                tool_choice,
+                                total_deadline=total_deadline,
+                                error=err,
+                                **kwargs,
+                            )
+                        )
+                    else:
+                        raise
+                    attempt_recorded = False
+                    last = None
+                    if not hasattr(result, "__aiter__"):
+                        await active_slot.__aexit__(None, None, None)
+                        active_slot = None
+                        self._charge_and_record(result, active_model)
+                        attempt_recorded = True
+                        yield result
+                        return
+                    active_stream = result
+        finally:
+            if not attempt_recorded:
+                self._charge_and_record(last, active_model)
+            if active_stream is not None:
+                await self._close_stream(active_stream)
+            if active_slot is not None:
+                await active_slot.__aexit__(None, None, None)
+
+    async def _timed_stream(
+        self,
+        stream: Any,
+        request_deadline: float,
+        total_deadline: float,
+    ) -> AsyncGenerator[ChatResponse, None]:
+        iterator = stream.__aiter__()
+        while True:
+            try:
+                chunk = await _bounded(
+                    iterator.__anext__(),
+                    request_deadline=request_deadline,
+                    total_deadline=total_deadline,
+                )
+            except StopAsyncIteration:
+                return
+            yield chunk
 
     @staticmethod
-    async def _release_after_stream(slot: Any, stream: Any) -> AsyncGenerator[ChatResponse, None]:
-        """把闸门名额持有到流真正读完（含调用方提前中断的情况）。"""
-        last: Any = None
+    async def _close_stream(stream: Any) -> None:
+        close = getattr(stream, "aclose", None)
+        if close is None:
+            return
         try:
-            async for chunk in stream:
-                last = chunk
-                yield chunk
-        finally:
-            # 流式的 usage 在最后一个 chunk 上，读完再记账
-            _charge_budget(last)
-            await slot.__aexit__(None, None, None)
+            await close()
+        except Exception:  # Cleanup must not hide the upstream error.
+            pass
+
+    def _charge_and_record(self, response: Any, model_name: str) -> None:
+        _charge_budget(response)
+        self._record_usage(response, model_name)
+
+    def _record_usage(self, response: Any, model_name: str) -> None:
+        if self._usage_recorder is None:
+            return
+        try:
+            record = self._usage_recorder.record(response, model=model_name)
+            logger.info(
+                "model.usage model=%s usage_status=%s input_tokens=%s output_tokens=%s "
+                "total_tokens=%s estimated_cost_usd=%s pricing_version=%s billing_status=unavailable",
+                record.model,
+                record.usage_status,
+                record.input_tokens,
+                record.output_tokens,
+                record.total_tokens,
+                record.estimated_cost_usd,
+                record.pricing_version,
+            )
+        except Exception as err:  # Usage recording must never break an intent.
+            logger.debug("模型 usage 记录跳过（不影响主链路）：%s", err)
 
     async def _invoke_upstream(
         self,
@@ -109,11 +273,35 @@ class ThrottledChatModel(OpenAIChatModel):
         if tier != "main":
             hint = minimal_mode_hint()
             if hint:
-                messages = [*messages, Msg(name="system", content=hint, role="system")]
+                messages = [
+                    *messages,
+                    Msg(name="system", content=[TextBlock(text=hint)], role="system"),
+                ]
             if self._fallback is not None:
                 logger.info("Token 预算档位 %s，切用备用模型 %s", tier, self._fallback.model)
                 self._publish_budget_tier(tier)
                 return await self._fallback(messages, tools, tool_choice, **kwargs)
+            return await self._invoke_primary(messages, tools, tool_choice, **kwargs)
+        decision = current_routing_decision()
+        if self._small_model is not None and can_use_small_model(decision):
+            logger.info(
+                "任务路由策略=%s 原因=%s 置信度=%.2f，使用轻量模型 %s",
+                decision.policy_version,
+                decision.reason,
+                decision.confidence,
+                self._small_model.model,
+            )
+            return await self._small_model(messages, tools, tool_choice, **kwargs)
+        return await self._invoke_primary(messages, tools, tool_choice, **kwargs)
+
+    async def _invoke_primary(
+        self,
+        messages: list[Msg],
+        tools: Optional[list[dict]],
+        tool_choice: Optional[ToolChoice],
+        **kwargs: Any,
+    ) -> ChatResponse | AsyncGenerator[ChatResponse, None]:
+        """Call the configured primary model without reapplying task routing."""
         return await super().__call__(messages, tools, tool_choice, **kwargs)
 
     def _publish_budget_tier(self, tier: str) -> None:
@@ -135,40 +323,142 @@ class ThrottledChatModel(OpenAIChatModel):
         messages: list[Msg],
         tools: Optional[list[dict]],
         tool_choice: Optional[ToolChoice],
+        *,
+        total_deadline: float,
+        retries: int,
         **kwargs: Any,
-    ) -> ChatResponse | AsyncGenerator[ChatResponse, None]:
-        last_error: Optional[BaseException] = None
-        for attempt in range(self._max_transient_retries + 1):
+    ) -> tuple[Any, Any, str, float, int]:
+        retries_used = 0
+        route_kind, route_model = self._configured_route()
+        last_error: Optional[Exception] = None
+        while True:
+            request_deadline = time.monotonic() + self._request_timeout_seconds
             try:
-                return await self._invoke_upstream(messages, tools, tool_choice, **kwargs)
-            except BaseException as err:
-                if not is_transient_error(err):
+                response, slot = await self._start_attempt(
+                    lambda: self._invoke_upstream(messages, tools, tool_choice, **kwargs),
+                    request_deadline,
+                    total_deadline,
+                )
+                return response, slot, route_model, request_deadline, retries - retries_used
+            except asyncio.CancelledError:
+                self._record_usage(None, route_model)
+                raise
+            except Exception as err:
+                self._record_usage(None, route_model)
+                if not _is_retryable_gateway_error(err):
                     raise
                 last_error = err
-                if attempt < self._max_transient_retries:
+                if retries_used < retries:
                     # 指数退避：网关速率类限流对固定间隔重试不敏感
-                    delay = self._retry_base_seconds * (3**attempt)
+                    delay = self._retry_base_seconds * (3**retries_used)
+                    retries_used += 1
                     logger.warning(
                         "模型 %s 遇上游瞬时故障，%.0fs 后重试（第 %d/%d 次）：%s",
-                        self.model, delay, attempt + 1, self._max_transient_retries, err,
+                        route_model, delay, retries_used, retries, err,
                     )
-                    await asyncio.sleep(delay)
+                    await _bounded(asyncio.sleep(delay), total_deadline=total_deadline)
+                    continue
+                break
 
-        if self._fallback is None:
+        if route_kind == "task_small":
+            return await self._promote_small_to_main(
+                messages,
+                tools,
+                tool_choice,
+                total_deadline=total_deadline,
+                error=last_error,
+                **kwargs,
+            )
+
+        # Budget-routed requests already used the configured budget model. Do not
+        # silently loop back to the primary or another fallback after it fails.
+        if route_kind != "main" or self._fallback is None:
             raise last_error  # type: ignore[misc]
 
         logger.warning("模型 %s 重试用尽，回退到 %s：%s", self.model, self._fallback.model, last_error)
         self._publish_fallback(str(last_error))
-        return await self._fallback(messages, tools, tool_choice, **kwargs)
+        request_deadline = time.monotonic() + self._request_timeout_seconds
+        response, slot = await self._start_attempt(
+            lambda: self._fallback(messages, tools, tool_choice, **kwargs),
+            request_deadline,
+            total_deadline,
+        )
+        return response, slot, str(self._fallback.model), request_deadline, 0
+
+    async def _promote_small_to_main(
+        self,
+        messages: list[Msg],
+        tools: Optional[list[dict]],
+        tool_choice: Optional[ToolChoice],
+        *,
+        total_deadline: float,
+        error: BaseException,
+        **kwargs: Any,
+    ) -> tuple[Any, Any, str, float, int]:
+        small_name = str(self._small_model.model) if self._small_model is not None else "small"
+        logger.warning("轻量模型 %s 瞬时失败，在总 deadline 内升级到主模型：%s", small_name, error)
+        self._publish_model_fallback(small_name, str(self.model), str(error))
+        request_deadline = time.monotonic() + self._request_timeout_seconds
+        response, slot = await self._start_attempt(
+            lambda: self._invoke_primary(messages, tools, tool_choice, **kwargs),
+            request_deadline,
+            total_deadline,
+        )
+        return response, slot, str(self.model), request_deadline, 0
+
+    def _configured_route(self) -> tuple[str, str]:
+        if current_tier() != "main":
+            if self._fallback is not None:
+                return "budget", str(self._fallback.model)
+            return "main", str(self.model)
+        decision = current_routing_decision()
+        if self._small_model is not None and can_use_small_model(decision):
+            return "task_small", str(self._small_model.model)
+        return "main", str(self.model)
+
+    def _budget_route_model(self) -> str:
+        """Compatibility helper returning the model selected for this context."""
+        return self._configured_route()[1]
+
+    async def _start_attempt(
+        self,
+        call: Any,
+        request_deadline: float,
+        total_deadline: float,
+    ) -> tuple[Any, Any]:
+        slot = self._throttle.slot()
+        entered = False
+        try:
+            await _bounded(
+                slot.__aenter__(),
+                request_deadline=request_deadline,
+                total_deadline=total_deadline,
+            )
+            entered = True
+            response = await _bounded(
+                call(),
+                request_deadline=request_deadline,
+                total_deadline=total_deadline,
+            )
+            return response, slot
+        except BaseException as err:
+            if entered:
+                await slot.__aexit__(type(err), err, err.__traceback__)
+            raise
 
     def _publish_fallback(self, reason: str) -> None:
         if self._bus is None or self._fallback is None:
+            return
+        self._publish_model_fallback(str(self.model), str(self._fallback.model), reason)
+
+    def _publish_model_fallback(self, from_model: str, to_model: str, reason: str) -> None:
+        if self._bus is None:
             return
         session_id = ShoppingContext.current_session_id()
         self._bus.publish(
             session_id,
             "model.fallback",
-            {"from": self.model, "to": self._fallback.model, "reason": reason},
+            {"from": from_model, "to": to_model, "reason": reason},
         )
 
 
@@ -185,6 +475,55 @@ def _safe_field(source: Any, name: str) -> Any:
         return getattr(source, name, None)
     except Exception:  # noqa: BLE001 —— 包含 KeyError 等非标准实现
         return None
+
+
+async def _bounded(
+    awaitable: Any,
+    *,
+    total_deadline: float,
+    request_deadline: Optional[float] = None,
+) -> Any:
+    deadlines = [total_deadline]
+    if request_deadline is not None:
+        deadlines.append(request_deadline)
+    remaining = min(deadlines) - time.monotonic()
+    if remaining <= 0:
+        close = getattr(awaitable, "close", None)
+        if close is not None:
+            close()
+        raise TimeoutError("model request deadline exceeded")
+    try:
+        async with asyncio.timeout(remaining):
+            return await awaitable
+    except TimeoutError:
+        raise TimeoutError("model request deadline exceeded") from None
+
+
+def _is_non_retryable_http_error(error: BaseException) -> bool:
+    status = _http_status_code(error)
+    if status is None:
+        return False
+    return 400 <= status < 500 and status not in {408, 425, 429}
+
+
+def _http_status_code(error: BaseException) -> Optional[int]:
+    status = _safe_field(error, "status_code")
+    if status is None:
+        response = _safe_field(error, "response")
+        status = _safe_field(response, "status_code") if response is not None else None
+    try:
+        return int(status)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _is_retryable_gateway_error(error: BaseException) -> bool:
+    if _is_non_retryable_http_error(error):
+        return False
+    status = _http_status_code(error)
+    if status in {408, 425, 429} or (status is not None and 500 <= status < 600):
+        return True
+    return isinstance(error, TimeoutError) or is_transient_error(error)
 
 
 def _charge_budget(response: Any) -> None:
@@ -219,7 +558,21 @@ def create_chat_model(
     stream: bool = True,
     throttle: Optional[GatewayThrottle] = None,
     bus: Optional[TradeEventBus] = None,
-) -> OpenAIChatModel:
+    usage_recorder: Optional[ModelUsageLedger] = None,
+) -> Any:
+    if getattr(settings, "llm_mode", "live") == "mock":
+        from app.infrastructure.synthetic_model import SyntheticChatModel
+
+        return SyntheticChatModel(context_size=settings.context_size,
+            delay_seconds=getattr(settings, "mock_delay_seconds", 0.0))
+
+    pricing_version = getattr(settings, "llm_pricing_version", "")
+    pricing_rates = getattr(settings, "llm_pricing_rates", {})
+    if usage_recorder is None:
+        usage_recorder = ModelUsageLedger(
+            pricing_version=pricing_version,
+            rates=pricing_rates,
+        )
     credential = OpenAICredential(
         api_key=settings.llm_api_key,
         base_url=settings.llm_base_url,
@@ -227,6 +580,8 @@ def create_chat_model(
     common = {
         "credential": credential,
         "stream": stream,
+        # All retries are governed by ThrottledChatModel's request/total deadlines.
+        "max_retries": 0,
         # 上下文窗口：压缩触发阈值（ContextConfig.trigger_ratio）按此值比例计算
         "context_size": settings.context_size,
     }
@@ -235,11 +590,21 @@ def create_chat_model(
         if settings.llm_fallback_model and settings.llm_fallback_model != settings.llm_model
         else None
     )
+    small_model_name = getattr(settings, "llm_small_model", "")
+    small_model = (
+        OpenAIChatModel(model=small_model_name, **common)
+        if small_model_name and small_model_name != settings.llm_model
+        else None
+    )
     return ThrottledChatModel(
         model=settings.llm_model,
         throttle=throttle or GatewayThrottle(settings.llm_max_concurrency, settings.llm_min_interval_seconds),
         fallback=fallback,
+        small_model=small_model,
         max_transient_retries=settings.llm_max_retries,
+        request_timeout_seconds=getattr(settings, "llm_request_timeout_seconds", 30.0),
+        total_timeout_seconds=getattr(settings, "llm_total_timeout_seconds", 90.0),
+        usage_recorder=usage_recorder,
         bus=bus,
         **common,
     )

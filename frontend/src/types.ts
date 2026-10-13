@@ -8,6 +8,7 @@ export type TradeEventType =
   | "plan.update"
   | "context.compressed"
   | "model.fallback"
+  | "approval.required"
   | "final.result"
   | "error";
 

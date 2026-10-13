@@ -133,14 +133,13 @@ def score_case(judged: dict) -> tuple[float, bool]:
 
 async def run_case(client: httpx.AsyncClient, case: dict, ground_truth: str) -> dict:
     session_id = f"eval-{case['id']}-{uuid.uuid4().hex[:6]}"
-    buyer_id = case.get("buyer_id") or f"eval-buyer-{case['id']}"
     transcript_lines: list[str] = []
     for query in case["queries"]:
         response = await client.post(
             f"{BASE_URL}/commerce/intents",
+            headers={"Authorization": "Bearer " + os.environ["GLOBEX_ACCESS_TOKEN"]},
             json={
                 "shopping_session_id": session_id,
-                "buyer_id": buyer_id,
                 "locale": "zh-CN",
                 "currency": "CNY",
                 "raw_query": query,

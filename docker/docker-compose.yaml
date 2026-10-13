@@ -17,9 +17,12 @@ services:
       - "8000:8000"
     environment:
       # 敏感配置透传宿主机环境变量，缺失时直接报错，避免明文落盘
-      LLM_BASE_URL: ${LLM_BASE_URL:?需设置 LLM_BASE_URL}
-      LLM_API_KEY: ${LLM_API_KEY:?需设置 LLM_API_KEY}
+      LLM_BASE_URL: ${LLM_BASE_URL:-https://api.openai.com/v1}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_MODE: ${LLM_MODE:-live}
+      GLOBEX_AUTH_TOKENS: ${GLOBEX_AUTH_TOKENS:?需设置认证目录}
       LLM_MODEL: ${LLM_MODEL:-qwen3-max}
+      LLM_SMALL_MODEL: ${LLM_SMALL_MODEL:-}
       # 四期：网关配额闸门与限流回退（不配则用 settings 默认值）
       LLM_FALLBACK_MODEL: ${LLM_FALLBACK_MODEL:-qwen-plus}
       LLM_MAX_CONCURRENCY: ${LLM_MAX_CONCURRENCY:-2}
@@ -56,9 +59,12 @@ services:
       dockerfile: Dockerfile
     command: ["python", "-m", "app.worker"]
     environment:
-      LLM_BASE_URL: ${LLM_BASE_URL:?需设置 LLM_BASE_URL}
-      LLM_API_KEY: ${LLM_API_KEY:?需设置 LLM_API_KEY}
+      LLM_BASE_URL: ${LLM_BASE_URL:-https://api.openai.com/v1}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_MODE: ${LLM_MODE:-live}
+      GLOBEX_AUTH_TOKENS: ${GLOBEX_AUTH_TOKENS:?需设置认证目录}
       LLM_MODEL: ${LLM_MODEL:-qwen3-max}
+      LLM_SMALL_MODEL: ${LLM_SMALL_MODEL:-}
       LLM_FALLBACK_MODEL: ${LLM_FALLBACK_MODEL:-qwen-plus}
       LLM_MAX_CONCURRENCY: ${LLM_MAX_CONCURRENCY:-2}
       LLM_MIN_INTERVAL_SECONDS: ${LLM_MIN_INTERVAL_SECONDS:-1.0}
@@ -103,9 +109,9 @@ services:
     restart: unless-stopped
 
   frontend:
-    image: node:22-alpine
+    image: node:22.22.2-alpine
     working_dir: /app
-    command: sh -c "npm install && npm run dev"
+    command: sh -c "npm ci && npm run dev"
     ports:
       - "5173:5173"
     environment:

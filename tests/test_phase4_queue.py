@@ -28,8 +28,8 @@ class FakeStreamClient:
     """模拟 Redis Stream 的消费者组语义：未 ack 的消息留在 pending。"""
 
     def __init__(self) -> None:
-        self.entries: list[tuple[str, dict]] = []
-        self.pending: dict[str, int] = {}  # message_id -> times_delivered
+        self.entries: list[tuple[str, str, dict]] = []
+        self.pending: dict[str, dict | int] = {}  # message_id -> owner and delivery count
         self.acked: list[str] = []
         self.dead: list[dict] = []
         self.kv: dict[str, str] = {}
@@ -45,27 +45,89 @@ class FakeStreamClient:
         if stream.endswith(":dead"):
             self.dead.append(fields)
         else:
-            self.entries.append((message_id, fields))
+            self.entries.append((stream, message_id, fields))
         return message_id
 
-    async def xreadgroup(self, _group, _consumer, _streams, count=1, block=0):
-        available = [
-            (mid, fields)
-            for mid, fields in self.entries
-            if mid not in self.acked and mid not in self.pending
-        ]
-        batch = available[:count]
-        for mid, _fields in batch:
-            self.pending[mid] = 1
-        return [("globex:intents", batch)] if batch else []
+    async def xreadgroup(self, _group, consumer, streams, count=1, block=0):
+        result = []
+        selected = 0
+        for stream in streams:
+            batch = [
+                (mid, fields)
+                for entry_stream, mid, fields in self.entries
+                if entry_stream == stream and mid not in self.acked and mid not in self.pending
+            ][:max(0, count - selected)]
+            for mid, _fields in batch:
+                self.pending[mid] = {"consumer": consumer, "times_delivered": 1, "idle_ms": 0}
+            if batch:
+                result.append((stream, batch))
+                selected += len(batch)
+            if selected >= count:
+                break
+        return result
+
+    async def xautoclaim(self, stream, _group, consumer, min_idle_time, start_id="0-0", count=10):
+        batch = []
+        for entry_stream, mid, fields in self.entries:
+            pending = self.pending.get(mid)
+            if (
+                entry_stream == stream and isinstance(pending, dict)
+                and pending["idle_ms"] >= min_idle_time and len(batch) < count
+            ):
+                pending["consumer"] = consumer
+                pending["times_delivered"] += 1
+                pending["idle_ms"] = 0
+                batch.append((mid, fields))
+        return "0-0", batch, []
+
+    async def xclaim(self, stream, _group, consumer, min_idle_time, message_ids, idle=0, **_kwargs):
+        claimed = []
+        for mid in message_ids:
+            pending = self.pending.get(mid)
+            if isinstance(pending, dict) and pending["idle_ms"] >= min_idle_time:
+                pending["consumer"] = consumer
+                pending["idle_ms"] = idle
+                entry = next(
+                    ((entry_id, fields) for entry_stream, entry_id, fields in self.entries
+                     if entry_stream == stream and entry_id == mid),
+                    None,
+                )
+                if entry:
+                    claimed.append(entry)
+        return claimed
 
     async def xack(self, _stream, _group, message_id):
         self.acked.append(message_id)
         self.pending.pop(message_id, None)
 
+    async def eval(self, script, numkeys, *values):
+        keys = values[:numkeys]
+        args = values[numkeys:]
+        stream = keys[0]
+        message_id = args[1]
+        consumer = args[2]
+        pending = self.pending.get(message_id)
+        if not isinstance(pending, dict) or pending["consumer"] != consumer:
+            return 0
+        if "XACK" in script:
+            self.acked.append(message_id)
+            self.pending.pop(message_id, None)
+            return 1
+        if "XCLAIM" in script:
+            pending["idle_ms"] = 0
+            return 1
+        if "SET" in script:
+            self.kv[keys[1]] = args[3]
+            return 1
+        raise AssertionError(f"unknown Redis Lua script: {script}")
+
     async def xpending_range(self, _stream, _group, start, _end, _count):
-        times = self.pending.get(start, 1)
-        return [{"times_delivered": times}]
+        pending = self.pending.get(start)
+        if pending is None:
+            return []
+        if isinstance(pending, int):
+            return [{"times_delivered": pending}]
+        return [{"consumer": pending["consumer"], "times_delivered": pending["times_delivered"]}]
 
     async def xinfo_groups(self, _stream):
         return [{"name": "globex-workers", "lag": len(self.entries) - len(self.acked)}]
@@ -84,7 +146,11 @@ class FakeStreamClient:
 
     def redeliver(self, message_id: str) -> None:
         """模拟 Redis 把未 ack 的消息重新投递给消费者。"""
-        self.pending[message_id] = self.pending.get(message_id, 1) + 1
+        pending = self.pending.get(message_id, 1)
+        if isinstance(pending, dict):
+            pending["times_delivered"] += 1
+        else:
+            self.pending[message_id] = pending + 1
 
 
 def _task(task_id: str = "task-1") -> IntentTask:

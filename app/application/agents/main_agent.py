@@ -15,7 +15,9 @@ AgentState 每轮落盘 DATA_DIR/sessions/，服务重启后恢复多轮对话�
 """
 from __future__ import annotations
 
+import asyncio
 import logging
+from contextlib import asynccontextmanager
 from typing import Optional
 
 from agentscope.agent import Agent, ReActConfig
@@ -163,31 +165,80 @@ class SessionRegistry:
     """按 shopping_session_id 缓存 MainAgent 实例，支撑多轮对话；
     AgentState 经 SessionStore 端口落盘（SQLite 或文件），服务重启后恢复。"""
 
-    def __init__(self, main_factory: MainAgentFactory, session_store: SessionStore) -> None:
+    def __init__(self, main_factory: MainAgentFactory, session_store: SessionStore, *, strict_restore: bool = False) -> None:
         self._main_factory = main_factory
         self._session_store = session_store
+        self._strict_restore = strict_restore
         self._agents: dict[str, Agent] = {}
+        self._session_locks: dict[str, asyncio.Lock] = {}
+        self._session_lock_owners: dict[str, asyncio.Task] = {}
+        self._session_lock_depths: dict[str, int] = {}
+
+    @asynccontextmanager
+    async def serialize(self, shopping_session_id: str):
+        """Serialize local turns for a session; reentrant for registry operations."""
+        task = asyncio.current_task()
+        if task is None:
+            raise RuntimeError("session serialization requires an asyncio task")
+        lock = self._session_locks.setdefault(shopping_session_id, asyncio.Lock())
+        if self._session_lock_owners.get(shopping_session_id) is task:
+            self._session_lock_depths[shopping_session_id] += 1
+            try:
+                yield
+            finally:
+                self._session_lock_depths[shopping_session_id] -= 1
+            return
+
+        await lock.acquire()
+        self._session_lock_owners[shopping_session_id] = task
+        self._session_lock_depths[shopping_session_id] = 1
+        try:
+            yield
+        finally:
+            self._session_lock_owners.pop(shopping_session_id, None)
+            self._session_lock_depths.pop(shopping_session_id, None)
+            lock.release()
 
     async def get_or_create(self, shopping_session_id: str) -> Agent:
-        if shopping_session_id not in self._agents:
+        async with self.serialize(shopping_session_id):
+            if shopping_session_id not in self._agents:
+                restored_state = await self._try_restore(shopping_session_id)
+                self._agents[shopping_session_id] = self._main_factory.build(restored_state)
+            return self._agents[shopping_session_id]
+
+    async def refresh(self, shopping_session_id: str) -> Agent:
+        """Reload persisted AgentScope state after this process acquires a session lease."""
+        async with self.serialize(shopping_session_id):
             restored_state = await self._try_restore(shopping_session_id)
             self._agents[shopping_session_id] = self._main_factory.build(restored_state)
-        return self._agents[shopping_session_id]
+            return self._agents[shopping_session_id]
+
+    async def restore_snapshot(self, shopping_session_id: str, snapshot_json: str) -> Agent:
+        """Install a native per-turn checkpoint over the last completed session snapshot."""
+        async with self.serialize(shopping_session_id):
+            state = AgentState.model_validate_json(snapshot_json)
+            self._agents[shopping_session_id] = self._main_factory.build(state)
+            logger.info("会话 turn checkpoint 已恢复：%s（%d 条上下文）",
+                        shopping_session_id, len(state.context))
+            return self._agents[shopping_session_id]
 
     async def persist(self, shopping_session_id: str) -> None:
-        """每轮对话结束后落盘 AgentState 快照；失败仅告警不影响主链路。"""
-        agent = self._agents.get(shopping_session_id)
-        if agent is None:
-            return
-        try:
-            await self._session_store.save(shopping_session_id, agent.state.model_dump_json())
-        except Exception as err:  # noqa: BLE001
-            logger.warning("会话状态落盘失败：%s（%s）", shopping_session_id, err)
+        """Persist a compatibility mirror; fenced SQLite checkpoints remain authoritative."""
+        async with self.serialize(shopping_session_id):
+            agent = self._agents.get(shopping_session_id)
+            if agent is None:
+                return
+            try:
+                await self._session_store.save(shopping_session_id, agent.state.model_dump_json())
+            except Exception as err:  # noqa: BLE001
+                logger.warning("会话状态落盘失败：%s（%s）", shopping_session_id, err)
 
     async def _try_restore(self, shopping_session_id: str) -> Optional[AgentState]:
         try:
             raw = await self._session_store.load(shopping_session_id)
         except Exception as err:  # noqa: BLE001 —— 存储不可用时按新会话继续，不阻断对话
+            if self._strict_restore:
+                raise RuntimeError("SESSION_RESTORE_UNAVAILABLE") from err
             logger.warning("会话状态读取失败，按新会话处理：%s（%s）", shopping_session_id, err)
             return None
         if raw is None:
@@ -197,5 +248,7 @@ class SessionRegistry:
             logger.info("会话状态已恢复：%s（%d 条上下文）", shopping_session_id, len(state.context))
             return state
         except Exception as err:  # noqa: BLE001 —— 快照损坏按新会话处理
+            if self._strict_restore:
+                raise RuntimeError("SESSION_SNAPSHOT_INVALID") from err
             logger.warning("会话状态恢复失败，按新会话处理：%s（%s）", shopping_session_id, err)
             return None

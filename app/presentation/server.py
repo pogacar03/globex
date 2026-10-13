@@ -22,12 +22,14 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import json
 import logging
 import time
 import uuid
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, WebSocket
+from fastapi import FastAPI, HTTPException, WebSocket, Request
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 
@@ -40,13 +42,15 @@ from app.presentation.dto import (
     SubmitIntentRequest,
     SubmitIntentResponse,
 )
+from app.infrastructure.security.auth_identity import AuthDirectory, AuthError, Principal
+from app.infrastructure.security.approval_store import ApprovalError
+from app.infrastructure.security.approved_actions import ApprovedActionError
+from app.infrastructure.runtime_checkpoint import CheckpointConflictError
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 
 logger = logging.getLogger(__name__)
 
-# 幂等键有效期：同一会话同一句话在此窗口内重复提交视为重复请求
-_IDEMPOTENCY_TTL_SECONDS = 600
 # 轮数计数器存活时长：比幂等窗口长得多，让一整段会话都能被正确分类
 _TURN_COUNTER_TTL_SECONDS = 86400
 
@@ -70,7 +74,8 @@ def build_app() -> FastAPI:
     async def lifespan(_: FastAPI):
         c = await build_container()
         state["c"] = c
-        state["connections"] = ConnectionManager(c.bus)
+        state["auth"] = AuthDirectory.from_json(getattr(c.settings, "auth_tokens_json", "{}"))
+        state["connections"] = ConnectionManager(c.bus, state["auth"])
         await c.startup()
         if c.backplane is not None:
             # 跨进程事件转发：不开这个任务，worker 产生的流式事件到不了前端
@@ -87,6 +92,53 @@ def build_app() -> FastAPI:
             await c.shutdown()
 
     api = FastAPI(title="Globex 跨境电商 Agent", version="0.4.0", lifespan=lifespan)
+
+    @api.middleware("http")
+    async def authenticate_request(request: Request, call_next):
+        if request.url.path.startswith("/commerce/"):
+            scheme, _, token = request.headers.get("authorization", "").partition(" ")
+            try:
+                if scheme.lower() != "bearer" or "auth" not in state:
+                    raise AuthError("authentication required")
+                request.state.principal = state["auth"].authenticate(token)
+            except AuthError:
+                return JSONResponse({"detail": "AUTHENTICATION_REQUIRED"}, status_code=401,
+                    headers={"WWW-Authenticate": "Bearer"})
+        return await call_next(request)
+
+    def authority(request: Request, permission: str) -> Principal:
+        principal = request.state.principal
+        if permission not in principal.permissions:
+            raise HTTPException(status_code=403, detail="PERMISSION_DENIED")
+        return principal
+
+    def scoped_session(principal: Principal, raw: str | None) -> str:
+        try:
+            return principal.scope_session(raw)
+        except AuthError as err:
+            raise HTTPException(status_code=403, detail="SESSION_ACCESS_DENIED") from err
+
+    def intent_input(request: Request, body: SubmitIntentRequest) -> SubmitIntentInput:
+        principal = authority(request, "intent:submit")
+        if body.buyer_id is not None and body.buyer_id != principal.subject:
+            raise HTTPException(status_code=403, detail="IDENTITY_OVERRIDE_DENIED")
+        key = request.headers.get("idempotency-key")
+        if key is not None and (not key or len(key) > 128):
+            raise HTTPException(status_code=400, detail="INVALID_IDEMPOTENCY_KEY")
+        raw_session = body.shopping_session_id
+        if raw_session is None and key is not None:
+            raw_session = "idem-" + hashlib.sha256(key.encode()).hexdigest()[:32]
+        session_id = scoped_session(principal, raw_session)
+        task_id = "turn-" + (hashlib.sha256(f"{principal.buyer_key}\n{key}".encode()).hexdigest()
+            if key is not None else uuid.uuid4().hex)
+        return SubmitIntentInput(shopping_session_id=session_id, buyer_id=principal.buyer_key,
+            locale=body.locale, currency=body.currency, raw_query=body.raw_query,
+            task_id=task_id, approval_id=body.approval_id, permissions=tuple(sorted(principal.permissions)))
+
+    def successful_reply(text: str) -> str:
+        if not text.strip() or text.lstrip().startswith("[error]"):
+            raise HTTPException(status_code=502, detail="AGENT_EXECUTION_FAILED")
+        return text
 
     def container() -> Container:
         if "c" not in state:
@@ -112,66 +164,63 @@ def build_app() -> FastAPI:
                 async with c.db_engine.connect() as conn:
                     await conn.execute(text("select 1"))
                 database = c.db_engine.url.get_backend_name()
-            except Exception as err:  # noqa: BLE001
-                database = f"error: {err}"
+            except Exception:  # noqa: BLE001
+                database = "error"
         redis_state = "disabled"
         if c.cache.enabled:
             redis_state = "ok" if await c.cache.ping() else "error"
-        return {
-            "status": "ok",
-            "model": c.settings.llm_model,
+        unavailable = database == "error" or (c.task_queue is not None and redis_state == "error")
+        result = {
+            "status": "degraded" if unavailable else "ok",
+            "model": "synthetic-catalog-v1" if getattr(c.settings, "llm_mode", "live") == "mock" else c.settings.llm_model,
+            "model_mode": getattr(c.settings, "llm_mode", "live"),
             "database": database,
             "redis": redis_state,
             "semantic_cache": c.semantic_cache.enabled,
             "queue": "enabled" if c.task_queue is not None else "disabled",
             "queue_depth": await c.task_queue.depth() if c.task_queue is not None else 0,
         }
+        return JSONResponse(result, status_code=503) if unavailable else result
 
     @api.post("/commerce/intents", response_model=SubmitIntentResponse)
-    async def submit_intent(body: SubmitIntentRequest) -> SubmitIntentResponse:
+    async def submit_intent(body: SubmitIntentRequest, request: Request) -> SubmitIntentResponse:
         c = container()
-        session_id = body.shopping_session_id or f"session-{uuid.uuid4().hex[:8]}"
-        intent = SubmitIntentInput(
-            shopping_session_id=session_id,
-            buyer_id=body.buyer_id,
-            locale=body.locale,
-            currency=body.currency,
-            raw_query=body.raw_query,
-        )
+        intent = intent_input(request, body)
+        session_id = intent.shopping_session_id
         if c.task_queue is None:
-            result = await c.orchestrator.handle_intent(intent)
+            try:
+                result = await c.orchestrator.handle_intent(intent)
+            except CheckpointConflictError as error:
+                raise HTTPException(status_code=409, detail="IDEMPOTENCY_INPUT_CONFLICT") from error
+            except TimeoutError as error:
+                raise HTTPException(status_code=504, detail="TASK_DEADLINE_EXCEEDED") from error
             return SubmitIntentResponse(
-                shopping_session_id=result.shopping_session_id, final_text=result.final_text,
+                shopping_session_id=result.shopping_session_id, final_text=successful_reply(result.final_text),
             )
 
         task_id = await _enqueue(c, intent)
         final_text = await _await_result(c, task_id, session_id)
-        return SubmitIntentResponse(shopping_session_id=session_id, final_text=final_text)
+        return SubmitIntentResponse(shopping_session_id=session_id, final_text=successful_reply(final_text))
 
     @api.post("/commerce/intents/async")
-    async def submit_intent_async(body: SubmitIntentRequest) -> dict:
+    async def submit_intent_async(body: SubmitIntentRequest, request: Request) -> dict:
         c = container()
-        session_id = body.shopping_session_id or f"session-{uuid.uuid4().hex[:8]}"
-        intent = SubmitIntentInput(
-            shopping_session_id=session_id,
-            buyer_id=body.buyer_id,
-            locale=body.locale,
-            currency=body.currency,
-            raw_query=body.raw_query,
-        )
+        intent = intent_input(request, body)
+        session_id = intent.shopping_session_id
         if c.task_queue is None:
             raise HTTPException(status_code=503, detail="队列未启用，请使用 /commerce/intents")
         task_id = await _enqueue(c, intent)
         return {"shopping_session_id": session_id, "task_id": task_id, "state": "queued"}
 
     @api.get("/commerce/tasks/{task_id}")
-    async def get_task(task_id: str) -> dict:
+    async def get_task(task_id: str, request: Request) -> dict:
         c = container()
+        principal = authority(request, "commerce:read")
         if c.task_queue is None:
             raise HTTPException(status_code=503, detail="队列未启用")
         status = await c.task_queue.get_status(task_id)
-        if status is None:
-            raise HTTPException(status_code=404, detail=f"任务不存在或已过期：{task_id}")
+        if status is None or status.buyer_id != principal.buyer_key:
+            raise HTTPException(status_code=404, detail="TASK_NOT_FOUND")
         return {
             "task_id": status.task_id,
             "state": status.state,
@@ -185,18 +234,76 @@ def build_app() -> FastAPI:
         await state["connections"].serve(websocket)
 
     @api.get("/commerce/orders/{order_id}")
-    async def get_order(order_id: str) -> dict:
+    async def get_order(order_id: str, request: Request) -> dict:
+        principal = authority(request, "commerce:read")
         try:
-            return await container().query_order.execute(order_id)
+            return await container().query_order.execute_owned(order_id, principal.buyer_key)
         except ValueError as err:
-            raise HTTPException(status_code=404, detail=str(err)) from err
+            raise HTTPException(status_code=404, detail="ORDER_NOT_FOUND") from err
 
     @api.post("/commerce/orders/{order_id}/cancel")
-    async def cancel_order_endpoint(order_id: str, body: CancelOrderRequest) -> dict:
+    async def cancel_order_endpoint(order_id: str, body: CancelOrderRequest, request: Request):
+        principal = authority(request, "commerce:write")
+        c = container()
+        session_id = scoped_session(principal, body.shopping_session_id)
         try:
-            return await container().cancel_order.execute(order_id, body.reason)
+            await c.query_order.execute_owned(order_id, principal.buyer_key)
         except ValueError as err:
-            raise HTTPException(status_code=400, detail=str(err)) from err
+            raise HTTPException(status_code=404, detail="ORDER_NOT_FOUND") from err
+        arguments = {"order_id": order_id, "reason": body.reason}
+        permit = await c.approvals.begin(principal.buyer_key, session_id, "cancel_order_tool", arguments, body.approval_id)
+        if permit.decision == "REQUIRE_APPROVAL":
+            proposal = await c.approvals.get(principal.buyer_key, permit.approval_id)
+            return JSONResponse({"decision": permit.decision, **proposal}, status_code=202)
+        if permit.decision == "REPLAY":
+            return permit.result
+        if permit.decision != "ALLOW":
+            raise HTTPException(status_code=409 if permit.decision == "RECONCILIATION_REQUIRED" else 403,
+                detail=permit.decision)
+        try:
+            result = await c.cancel_order.execute_owned(order_id, body.reason, principal.buyer_key)
+            await c.approvals.complete(permit.approval_id, result)
+            return result
+        except BaseException:
+            await c.approvals.mark_uncertain(permit.approval_id)
+            raise
+
+    @api.get("/commerce/me")
+    async def me(request: Request):
+        principal = request.state.principal
+        return {"tenant_id": principal.tenant_id, "subject": principal.subject,
+            "permissions": sorted(principal.permissions)}
+
+    @api.get("/commerce/approvals")
+    async def pending_approvals(shopping_session_id: str, request: Request):
+        principal = authority(request, "commerce:read")
+        session_id = scoped_session(principal, shopping_session_id)
+        return {"approvals": await container().approvals.pending(principal.buyer_key, session_id)}
+
+    @api.get("/commerce/approvals/{approval_id}")
+    async def get_approval(approval_id: str, request: Request):
+        principal = authority(request, "commerce:read")
+        try:
+            return await container().approvals.get(principal.buyer_key, approval_id)
+        except ApprovalError as err:
+            raise HTTPException(status_code=404, detail="APPROVAL_NOT_FOUND") from err
+
+    @api.post("/commerce/approvals/{approval_id}/approve")
+    async def approve(approval_id: str, request: Request):
+        principal = authority(request, "commerce:write")
+        try:
+            return await container().approvals.approve(principal.buyer_key, approval_id)
+        except ApprovalError as err:
+            raise HTTPException(status_code=409, detail="APPROVAL_UNAVAILABLE") from err
+
+    @api.post("/commerce/approvals/{approval_id}/execute")
+    async def execute_approval(approval_id: str, request: Request):
+        principal = authority(request, "commerce:write")
+        try:
+            return await container().approved_actions.execute(principal.buyer_key, approval_id,
+                tuple(sorted(principal.permissions)))
+        except ApprovedActionError as error:
+            raise HTTPException(status_code=error.status_code, detail=error.reason) from error
 
     return api
 
@@ -220,38 +327,33 @@ async def _queue_priority(c: Container, session_id: str) -> int:
 
 
 async def _enqueue(c: Container, intent: SubmitIntentInput) -> str:
-    """入队并做幂等保护。
-
-    队列是 at-least-once，且买家/前端可能重复提交。用「会话 + 问句」指纹做幂等键，
-    命中说明短时间内已提交过同样内容，直接复用原 task_id，不再入队一次。
-    这一步对写操作（下单）尤其关键：重复消费等于重复下单。
-    """
-    fingerprint = hashlib.sha256(
-        f"{intent.shopping_session_id}\n{intent.raw_query}".encode(),
-    ).hexdigest()[:32]
-    idem_key = f"idem:{fingerprint}"
-    task_id = f"task-{uuid.uuid4().hex[:12]}"
-
-    acquired = await c.cache.set_if_absent(idem_key, task_id, _IDEMPOTENCY_TTL_SECONDS)
-    if not acquired:
-        previous = await c.cache.get_raw(idem_key)
-        if previous:
-            logger.info("幂等命中，复用已有任务：%s", previous)
-            return previous
-
-    await c.task_queue.enqueue(  # type: ignore[union-attr]
-        IntentTask(
+    """Stable task identity; Redis atomically binds input, queue entry and status."""
+    fingerprint = intent.fingerprint()
+    task_id = intent.task_id or f"turn-{uuid.uuid4().hex}"
+    runtime_checkpoints = getattr(c, "runtime_checkpoints", None)
+    if runtime_checkpoints is not None:
+        try:
+            await runtime_checkpoints.validate_binding(task_id, intent.buyer_id,
+                intent.shopping_session_id, fingerprint)
+        except CheckpointConflictError as error:
+            raise HTTPException(status_code=409, detail="IDEMPOTENCY_INPUT_CONFLICT") from error
+    task = IntentTask(
             task_id=task_id,
             shopping_session_id=intent.shopping_session_id,
             buyer_id=intent.buyer_id,
             locale=intent.locale,
             currency=intent.currency,
             raw_query=intent.raw_query,
+            approval_id=intent.approval_id,
+            permissions=intent.permissions,
             priority=await _queue_priority(c, intent.shopping_session_id),
-        ),
-    )
-    await c.task_queue.set_status(TaskStatus(task_id=task_id, state="queued"))  # type: ignore[union-attr]
-    c.bus.publish(intent.shopping_session_id, "task.queued", {"task_id": task_id})
+        )
+    try:
+        created = await c.task_queue.enqueue_once(task, fingerprint)  # type: ignore[union-attr]
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail="IDEMPOTENCY_INPUT_CONFLICT") from error
+    if created:
+        c.bus.publish(intent.shopping_session_id, "task.queued", {"task_id": task_id})
     return task_id
 
 
@@ -274,8 +376,11 @@ async def _await_result(c: Container, task_id: str, session_id: str) -> str:
                 if status is not None and status.state == "failed":
                     return f"[error] {status.error}"
                 continue
-            if event.type == "final.result":
-                return str(event.payload.get("text", ""))
+            status = await c.task_queue.get_status(task_id)
+            if status is not None and status.state == "done":
+                return status.final_text
+            if status is not None and status.state == "failed":
+                return "[error] AGENT_EXECUTION_FAILED"
         return "[error] 处理超时，请稍后重试或改用异步接口查询任务状态"
     finally:
         c.bus.unsubscribe(session_id, queue)

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import time
 import uuid
 from datetime import datetime
@@ -39,7 +40,7 @@ SERIAL_QUERY = (
 async def collect_events(session_id: str, stop: asyncio.Event) -> list[dict]:
     events: list[dict] = []
     async with websockets.connect(WS_URL) as ws:
-        await ws.send(json.dumps({"shopping_session_id": session_id}))
+        await ws.send(json.dumps({"shopping_session_id": session_id, "access_token": os.environ["GLOBEX_ACCESS_TOKEN"]}))
         while not stop.is_set():
             try:
                 raw = await asyncio.wait_for(ws.recv(), timeout=1)
@@ -81,12 +82,11 @@ async def run_round(label: str, query: str) -> dict:
     await asyncio.sleep(0.5)
 
     started = time.monotonic()
-    async with httpx.AsyncClient(timeout=900) as client:
+    async with httpx.AsyncClient(timeout=900, headers={"Authorization": "Bearer " + os.environ["GLOBEX_ACCESS_TOKEN"]}) as client:
         response = await client.post(
             f"{BASE_URL}/commerce/intents",
             json={
                 "shopping_session_id": session_id,
-                "buyer_id": f"parallel-buyer-{label}",
                 "locale": "zh-CN",
                 "currency": "CNY",
                 "raw_query": query,

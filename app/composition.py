@@ -41,6 +41,7 @@ from app.infrastructure.persistence.in_memory_repositories import (
     InMemoryOrderRepository,
     InMemoryProductRepository,
 )
+from app.infrastructure.persistence.startup_lock import schema_startup_lock
 from app.infrastructure.persistence.json_file_stores import (
     JsonFileConversationStore,
     JsonFilePreferenceStore,
@@ -65,6 +66,10 @@ from app.infrastructure.rag.category_knowledge import (
 from app.infrastructure.rerank.http_reranker import HttpReranker
 from app.infrastructure.resilience import CircuitBreakerRegistry
 from app.infrastructure.settings import Settings, load_settings
+from app.infrastructure.security.approval_store import ApprovalStore
+from app.infrastructure.security.approved_actions import ApprovedActionExecutor
+from app.application.tools.order_tools import build_create_order_tool, build_cancel_order_tool
+from app.infrastructure.runtime_checkpoint import RuntimeCheckpointStore
 from app.infrastructure.shared_breaker import SharedCircuitBreakerRegistry
 from app.infrastructure.throttle import GatewayThrottle
 from app.infrastructure.tracing import setup_tracing
@@ -100,27 +105,27 @@ class Container:
     cancel_order: CancelOrderUseCase
     product_repo: InMemoryProductRepository
     embedder: Any
-    vector_index: QdrantProductIndex
+    vector_index: Any
     knowledge_base: Any
     db_engine: Any
+    approvals: ApprovalStore
+    approved_actions: ApprovedActionExecutor
+    runtime_checkpoints: RuntimeCheckpointStore
 
     async def startup(self) -> None:
-        """建表 / 建向量库 / 建知识库。任一失败只告警，对应能力降级但服务可用。"""
+        """Required persistence and queue failures stop startup; retrieval may degrade."""
         if self.db_engine is not None:
-            try:
+            async with schema_startup_lock(self.settings.data_dir):
                 await bootstrap_schema(self.db_engine)
-            except Exception as err:  # noqa: BLE001
-                logger.warning("数据库建表失败，持久化能力不可用：%s", err)
         if isinstance(self.task_queue, RedisStreamTaskQueue):
-            try:
-                await self.task_queue.ensure_group()
-            except Exception as err:  # noqa: BLE001
-                logger.warning("队列消费者组创建失败：%s", err)
-        await bootstrap_product_index(self.product_repo, self.embedder, self.vector_index)
-        await bootstrap_category_knowledge(self.knowledge_base)
+            await self.task_queue.ensure_group()
+        if self.settings.llm_mode != "mock":
+            await bootstrap_product_index(self.product_repo, self.embedder, self.vector_index)
+            await bootstrap_category_knowledge(self.knowledge_base)
 
     async def shutdown(self) -> None:
-        await self.vector_index.close()
+        if self.vector_index is not None:
+            await self.vector_index.close()
         await self.cache.close()
         if self.db_engine is not None:
             await self.db_engine.dispose()
@@ -133,25 +138,29 @@ async def build_container() -> Container:
     # ---- Infrastructure ----
     product_repo = InMemoryProductRepository()
     bus = TradeEventBus()
-    vector_index = QdrantProductIndex(settings)
-    reranker = HttpReranker(settings) if settings.reranker_base_url else None
+    offline = settings.llm_mode == "mock"
+    vector_index = None if offline else QdrantProductIndex(settings)
+    reranker = HttpReranker(settings) if settings.reranker_base_url and not offline else None
 
     cache = RedisCache(settings.redis_url)
-    raw_embedder = OpenAIEmbeddingClient(settings)
+    raw_embedder = None if offline else OpenAIEmbeddingClient(settings)
     embedder = (
         CachedEmbeddingClient(raw_embedder, cache, settings.embedding_model)
-        if cache.enabled
+        if cache.enabled and not offline
         else raw_embedder
     )
     semantic_cache = SemanticCache(
         cache,
         embedder,
         threshold=settings.semantic_cache_threshold,
-        enabled=settings.semantic_cache_enabled,
+        enabled=settings.semantic_cache_enabled and not offline,
         # 模型名 + 提示词指纹入 key：改 prompt 或换模型后旧回复自动失效
         namespace=f"{settings.llm_model}:{_prompt_fingerprint()}",
     )
-    knowledge_base = build_category_knowledge_base(settings)
+    knowledge_base = None if offline else build_category_knowledge_base(settings)
+    approvals = ApprovalStore(settings.data_dir / "approvals.sqlite3")
+    runtime_checkpoints = RuntimeCheckpointStore(settings.data_dir / "runtime-checkpoints.sqlite3",
+        lease_ttl_seconds=settings.runtime_lease_seconds)
 
     # 队列与事件背板都依赖 Redis：没有 Redis 就退回单进程直跑
     task_queue: Optional[TaskQueue] = None
@@ -219,6 +228,7 @@ async def build_container() -> Container:
     )
     trade_factory = TradeAgentFactory(
         settings, place_order, query_order, cancel_order, bus, circuit_registry, throttle,
+        approvals=approvals,
     )
     # 偏好选取器：主 Agent 注入与子 Agent 注入共用同一实例，口径不会两头漂。
     # 用带缓存的 embedder：重复的偏好 statement 不会每轮重复 embed。
@@ -232,7 +242,7 @@ async def build_container() -> Container:
         loop_detector=loop_detector,
         preference_selector=preference_selector,
     )
-    sessions = SessionRegistry(main_factory, session_store)
+    sessions = SessionRegistry(main_factory, session_store, strict_restore=True)
     orchestrator = MainAgentOrchestrator(
         sessions, bus, preference_store, conversation_store, semantic_cache,
         output_guard_enabled=settings.output_guard_enabled,
@@ -241,6 +251,8 @@ async def build_container() -> Container:
         drift_detector=drift_detector,
         preference_selector=preference_selector,
         preference_top_k=settings.preference_top_k,
+        runtime_checkpoints=runtime_checkpoints,
+        task_timeout_seconds=settings.task_timeout_seconds,
     )
 
     return Container(
@@ -258,4 +270,8 @@ async def build_container() -> Container:
         vector_index=vector_index,
         knowledge_base=knowledge_base,
         db_engine=db_engine,
+        approvals=approvals,
+        approved_actions=ApprovedActionExecutor(approvals, build_create_order_tool(place_order, bus),
+            build_cancel_order_tool(cancel_order, bus), bus),
+        runtime_checkpoints=runtime_checkpoints,
     )

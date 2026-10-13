@@ -1,0 +1,49 @@
+name: Runtime acceptance
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  offline-runtime:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    services:
+      redis:
+        image: redis:7-alpine
+        ports: [6379:6379]
+        options: --health-cmd "redis-cli ping" --health-interval 5s --health-timeout 3s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.12.19"
+          python-version: "3.11"
+      - run: uv sync --frozen
+      - name: Full Python regression
+        env:
+          GLOBEX_TEST_REDIS_URL: redis://127.0.0.1:6379/14
+        run: uv run --frozen pytest -q
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.22.2"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Frontend type check and production build
+        working-directory: frontend
+        run: |
+          npm ci
+          npm test
+          npm run build
+      - name: Real Redis and independent process recovery
+        run: uv run --frozen python scripts/accept_runtime.py --redis-url redis://127.0.0.1:6379/15
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: synthetic-runtime-evidence
+          path: |
+            artifacts/runtime-acceptance/*.log
+            artifacts/runtime-acceptance/result.json
+          if-no-files-found: warn

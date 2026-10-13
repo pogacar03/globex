@@ -11,7 +11,8 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+import json
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -25,20 +26,20 @@ load_dotenv(PROJECT_ROOT / ".env")
 @dataclass(frozen=True)
 class Settings:
     llm_base_url: str
-    llm_api_key: str
+    llm_api_key: str = field(repr=False)
     llm_model: str
     port: int
     log_level: str
     # ---- 检索升级（模块一）----
     embedding_base_url: str
-    embedding_api_key: str
+    embedding_api_key: str = field(repr=False)
     embedding_model: str
     embedding_dim: int  # 知识库建库需显式维度（text-embedding-v4 实测 1024）
     qdrant_url: str  # 空 = qdrant-client 本地嵌入模式（DATA_DIR/qdrant）
     qdrant_collection: str
     reranker_base_url: str  # 空 = 降级为按向量分排序
     reranker_model: str
-    tavily_api_key: str  # 空 = 不注册 web_search_tool
+    tavily_api_key: str = field(repr=False)  # 空 = 不注册 web_search_tool
     # ---- 可观测（模块四）----
     otlp_endpoint: str  # 空 = 不启用 TracingMiddleware
     # ---- 数据目录（模块三）----
@@ -89,12 +90,26 @@ class Settings:
     preference_subagent_inject: bool = True  # 给检索子 Agent 注入偏好（纯本地拼装，零成本）
     queue_priority_enabled: bool = True  # 双队列优先级（无 Redis 时自动无效）
     queue_large_request_turns: int = 30  # 对话轮数 >= 此值走大请求队列
+    llm_mode: str = "live"
+    llm_small_model: str = ""
+    auth_tokens_json: str = field(default="{}", repr=False)
+    llm_request_timeout_seconds: float = 30.0
+    llm_total_timeout_seconds: float = 90.0
+    llm_pricing_version: str = ""
+    llm_pricing_rates: dict = field(default_factory=dict)
+    mock_delay_seconds: float = 0.0
+    queue_claim_idle_ms: int = 60000
+    runtime_lease_seconds: float = 30.0
+    task_timeout_seconds: float = 300.0
 
 
 def load_settings() -> Settings:
+    llm_mode = os.getenv("LLM_MODE", "live")
+    if llm_mode not in {"live", "mock"}:
+        raise RuntimeError("LLM_MODE must be live or mock")
     llm_base_url = os.getenv("LLM_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
     llm_api_key = os.getenv("LLM_API_KEY", "")
-    if not llm_api_key:
+    if not llm_api_key and llm_mode == "live":
         raise RuntimeError(
             "未配置 LLM_API_KEY，无法启动。请通过环境变量注入（推荐）："
             "export LLM_API_KEY=<你的密钥>；或在项目根目录创建本地 .env 文件"
@@ -103,6 +118,17 @@ def load_settings() -> Settings:
     data_dir = Path(os.getenv("DATA_DIR", str(PROJECT_ROOT / "data")))
     data_dir.mkdir(parents=True, exist_ok=True)  # SQLite 默认落在此目录，建库前必须存在
     return Settings(
+        llm_mode=llm_mode,
+        llm_small_model=os.getenv("LLM_SMALL_MODEL", ""),
+        auth_tokens_json=os.getenv("GLOBEX_AUTH_TOKENS", "{}"),
+        llm_request_timeout_seconds=float(os.getenv("LLM_REQUEST_TIMEOUT_SECONDS", "30")),
+        llm_total_timeout_seconds=float(os.getenv("LLM_TOTAL_TIMEOUT_SECONDS", "90")),
+        llm_pricing_version=os.getenv("LLM_PRICING_VERSION", ""),
+        llm_pricing_rates=json.loads(os.getenv("LLM_PRICING_RATES", "{}")),
+        mock_delay_seconds=float(os.getenv("MOCK_DELAY_SECONDS", "0")),
+        queue_claim_idle_ms=int(os.getenv("QUEUE_CLAIM_IDLE_MS", "60000")),
+        runtime_lease_seconds=float(os.getenv("RUNTIME_LEASE_SECONDS", "30")),
+        task_timeout_seconds=float(os.getenv("TASK_TIMEOUT_SECONDS", "300")),
         llm_base_url=llm_base_url,
         llm_api_key=llm_api_key,
         llm_model=os.getenv("LLM_MODEL", "qwen3-max"),

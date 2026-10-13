@@ -18,6 +18,9 @@ class ShoppingContextSnapshot:
     buyer_id: str
     locale: str
     currency: str
+    approval_id: str | None = None
+    task_id: str | None = None
+    permissions: tuple[str, ...] = ()
 
 
 _current_snapshot: ContextVar[Optional[ShoppingContextSnapshot]] = ContextVar(

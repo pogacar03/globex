@@ -32,6 +32,8 @@ from app.infrastructure.resilience import (
     CircuitBreakerRegistry,
     ToolResilienceMiddleware,
 )
+from app.infrastructure.security.approval_store import ApprovalStore
+from app.infrastructure.security.write_governance import WriteApprovalMiddleware
 from app.infrastructure.settings import Settings
 from app.infrastructure.tracing import build_agent_middlewares
 
@@ -46,6 +48,7 @@ class TradeAgentFactory:
         bus: TradeEventBus,
         circuit_registry: CircuitBreakerRegistry,
         throttle: GatewayThrottle,
+        approvals: ApprovalStore | None = None,
     ) -> None:
         self._settings = settings
         self._place_order = place_order
@@ -54,6 +57,7 @@ class TradeAgentFactory:
         self._bus = bus
         self._circuit_registry = circuit_registry
         self._throttle = throttle
+        self._write_approval = WriteApprovalMiddleware(approvals, bus)
 
     def _resilience(self) -> list:
         return [ToolResilienceMiddleware(self._circuit_registry, self._bus)]
@@ -63,7 +67,7 @@ class TradeAgentFactory:
         return [
             FunctionTool(
                 build_create_order_tool(self._place_order, self._bus),
-                middlewares=self._resilience(),
+                middlewares=[self._write_approval, *self._resilience()],
             ),
             FunctionTool(
                 build_query_order_tool(self._query_order, self._bus),
@@ -72,7 +76,7 @@ class TradeAgentFactory:
             ),
             FunctionTool(
                 build_cancel_order_tool(self._cancel_order, self._bus),
-                middlewares=self._resilience(),
+                middlewares=[self._write_approval, *self._resilience()],
             ),
         ]
 

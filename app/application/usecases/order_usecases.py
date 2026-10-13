@@ -75,6 +75,12 @@ class QueryOrderUseCase:
             raise ValueError(f"订单不存在：{order_id}")
         return order.snapshot()
 
+    async def execute_owned(self, order_id: str, buyer_id: str) -> dict:
+        order = await self._order_repo.find_by_id(order_id)
+        if order is None or order.buyer_id != buyer_id:
+            raise ValueError("订单不存在")
+        return order.snapshot()
+
 
 class CancelOrderUseCase:
     def __init__(self, product_repo: ProductRepository, order_repo: OrderRepository) -> None:
@@ -95,3 +101,9 @@ class CancelOrderUseCase:
                     sku.restore_stock(line.quantity)
         await self._order_repo.save(order)
         return order.snapshot()
+
+    async def execute_owned(self, order_id: str, reason: str, buyer_id: str) -> dict:
+        order = await self._order_repo.find_by_id(order_id)
+        if order is None or order.buyer_id != buyer_id:
+            raise ValueError("订单不存在")
+        return await self.execute(order_id, reason)

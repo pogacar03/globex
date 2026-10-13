@@ -33,6 +33,9 @@ class IntentTask:
     # 长会话（轮数多、上下文大）单次耗时明显更长，
     # 把它们分到单独队列，避免把短平快的新会话堵在后面。
     priority: int = 0
+    # 由可信服务端上下文传入；旧消息没有该字段时按未审批任务处理。
+    approval_id: Optional[str] = None
+    permissions: tuple[str, ...] = ()
 
     def to_dict(self) -> dict:
         return {
@@ -44,6 +47,8 @@ class IntentTask:
             "raw_query": self.raw_query,
             "enqueued_at": self.enqueued_at,
             "priority": self.priority,
+            "approval_id": self.approval_id,
+            "permissions": list(self.permissions),
         }
 
     @staticmethod
@@ -57,22 +62,33 @@ class IntentTask:
             raw_query=raw.get("raw_query", ""),
             enqueued_at=raw.get("enqueued_at", ""),
             priority=int(raw.get("priority", 0)),
+            approval_id=raw.get("approval_id"),
+            permissions=tuple(raw.get("permissions", [])),
         )
 
 
 @dataclass(frozen=True)
 class TaskStatus:
     task_id: str
-    state: str  # queued / running / done / failed
+    state: str  # queued / running / retrying / done / failed
     final_text: str = ""
     error: str = ""
     queue_position: int = 0
+    buyer_id: str = ""
 
 
 class TaskQueue(ABC):
     @abstractmethod
     async def enqueue(self, task: IntentTask) -> None:
         ...
+
+    async def enqueue_once(self, task: IntentTask, input_fingerprint: str) -> bool:
+        """Atomically enqueue task_id once, rejecting reuse for different input.
+
+        Implementations that cannot provide this guarantee must leave the
+        operation unsupported instead of falling back to a non-atomic enqueue.
+        """
+        raise NotImplementedError("atomic enqueue_once is not supported by this queue")
 
     @abstractmethod
     async def set_status(self, status: TaskStatus) -> None:

@@ -51,8 +51,10 @@ def build_create_order_tool(usecase: PlaceOrderUseCase, bus: TradeEventBus):
         """
         # 买家身份从 ShoppingContext 取真实值，不信任模型生成的入参，避免串账
         snapshot_ctx = ShoppingContext.current()
-        buyer_id = snapshot_ctx.buyer_id if snapshot_ctx else "anonymous"
-        session_id = ShoppingContext.current_session_id()
+        if snapshot_ctx is None or not snapshot_ctx.buyer_id or not snapshot_ctx.shopping_session_id:
+            return _fail("authenticated buyer context required")
+        buyer_id = snapshot_ctx.buyer_id
+        session_id = snapshot_ctx.shopping_session_id
         bus.publish(session_id, "tool.invoke", {"tool": "create_order_tool", "args": {"buyer_id": buyer_id, "items": items}})
         try:
             order_items = [
@@ -90,10 +92,13 @@ def build_query_order_tool(usecase: QueryOrderUseCase, bus: TradeEventBus):
             order_id (`str`):
                 订单号，如 "GBX-000001"。
         """
-        session_id = ShoppingContext.current_session_id()
+        snapshot_ctx = ShoppingContext.current()
+        if snapshot_ctx is None or not snapshot_ctx.buyer_id or not snapshot_ctx.shopping_session_id:
+            return _fail("authenticated buyer context required")
+        session_id = snapshot_ctx.shopping_session_id
         bus.publish(session_id, "tool.invoke", {"tool": "query_order_tool", "args": {"order_id": order_id}})
         try:
-            snapshot = await usecase.execute(order_id)
+            snapshot = await usecase.execute_owned(order_id, snapshot_ctx.buyer_id)
         except ValueError as err:
             bus.publish(session_id, "tool.result", {"tool": "query_order_tool", "error": str(err)})
             return _fail(str(err))
@@ -113,10 +118,13 @@ def build_cancel_order_tool(usecase: CancelOrderUseCase, bus: TradeEventBus):
             reason (`str`):
                 取消原因，必填。
         """
-        session_id = ShoppingContext.current_session_id()
+        snapshot_ctx = ShoppingContext.current()
+        if snapshot_ctx is None or not snapshot_ctx.buyer_id or not snapshot_ctx.shopping_session_id:
+            return _fail("authenticated buyer context required")
+        session_id = snapshot_ctx.shopping_session_id
         bus.publish(session_id, "tool.invoke", {"tool": "cancel_order_tool", "args": {"order_id": order_id, "reason": reason}})
         try:
-            snapshot = await usecase.execute(order_id, reason)
+            snapshot = await usecase.execute_owned(order_id, reason, snapshot_ctx.buyer_id)
         except ValueError as err:
             bus.publish(session_id, "tool.result", {"tool": "cancel_order_tool", "error": str(err)})
             return _fail(str(err))

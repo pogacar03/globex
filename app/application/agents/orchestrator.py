@@ -21,18 +21,22 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
+import math
 import time
+import uuid
 from dataclasses import dataclass
 from typing import Any, Optional
 
 from agentscope.agent import Agent
 from agentscope.event import (
+    ModelCallStartEvent,
     TextBlockDeltaEvent,
     ToolCallStartEvent,
     ToolResultEndEvent,
 )
-from agentscope.message import Msg, UserMsg
+from agentscope.message import Msg, ToolResultBlock, UserMsg
 
 from app.application.agents.main_agent import SessionRegistry
 from app.application.harness.drift_detector import DriftDetector
@@ -51,10 +55,17 @@ from app.domain.session.ports.conversation_store import (
 from app.domain.session.ports.session_store import SessionStore  # noqa: F401 —— 保留类型引用
 from app.infrastructure.cache.semantic_cache import SemanticCache
 from app.infrastructure.context import ShoppingContext, ShoppingContextSnapshot
+from app.infrastructure.task_routing import decide_route, set_routing_decision, reset_routing_decision
 from app.infrastructure.eventbus import TradeEventBus
 from app.infrastructure.budget import init_budget
 from app.infrastructure.security.output_guard import audit_output
 from app.infrastructure.transient import is_transient_error
+from app.infrastructure.runtime_checkpoint import (
+    RuntimeCheckpointStore,
+    SessionLease,
+    SessionLeaseLostError,
+    TurnCheckpoint,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -75,12 +86,43 @@ class SubmitIntentInput:
     locale: str
     currency: str
     raw_query: str
+    task_id: str | None = None
+    approval_id: str | None = None
+    permissions: tuple[str, ...] = ()
+
+    def fingerprint(self) -> str:
+        canonical = json.dumps(
+            {
+                "owner_id": self.buyer_id,
+                "session_id": self.shopping_session_id,
+                "locale": self.locale,
+                "currency": self.currency,
+                "raw_query": self.raw_query,
+                "approval_id": self.approval_id,
+                "permissions": sorted(self.permissions),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 @dataclass(frozen=True)
 class SubmitIntentOutput:
     shopping_session_id: str
     final_text: str
+
+
+@dataclass
+class _RuntimeTurn:
+    task_id: str
+    owner_id: str
+    session_id: str
+    input_fingerprint: str
+    lease: SessionLease
+    lease_lost: asyncio.Event
+    checkpoint: TurnCheckpoint
 
 
 def _tasks_snapshot(agent: Agent) -> dict:
@@ -107,7 +149,12 @@ class MainAgentOrchestrator:
         drift_detector: Optional[DriftDetector] = None,
         preference_selector: Optional[PreferenceSelector] = None,
         preference_top_k: int = 5,
+        runtime_checkpoints: Optional[RuntimeCheckpointStore] = None,
+        task_timeout_seconds: float = 300.0,
     ) -> None:
+        if not math.isfinite(task_timeout_seconds) or task_timeout_seconds <= 0:
+            raise ValueError("task_timeout_seconds must be finite and positive")
+        self._task_timeout_seconds = task_timeout_seconds
         self._sessions = sessions
         self._bus = bus
         self._preference_store = preference_store
@@ -120,6 +167,7 @@ class MainAgentOrchestrator:
         # 默认 selector 不带 embedder，退化为“按时间倒序取 top_k”，单测与无凭据环境可直接跑
         self._preference_selector = preference_selector or PreferenceSelector()
         self._preference_top_k = preference_top_k
+        self._runtime_checkpoints = runtime_checkpoints
         # 会话内已注入的偏好快照，变化时才重新注入，避免每轮重复填充上下文
         self._injected_preferences: dict[str, str] = {}
 
@@ -138,12 +186,145 @@ class MainAgentOrchestrator:
         return cleaned
 
     async def handle_intent(self, intent: SubmitIntentInput) -> SubmitIntentOutput:
+        routing_token = set_routing_decision(decide_route(intent.raw_query))
+        try:
+            deadline = asyncio.timeout(self._task_timeout_seconds)
+            async with deadline:
+                result = await self._handle_serialized_intent(intent)
+                if deadline.expired():
+                    raise TimeoutError("TASK_DEADLINE_EXCEEDED")
+                return result
+        finally:
+            reset_routing_decision(routing_token)
+
+    async def _handle_serialized_intent(self, intent: SubmitIntentInput) -> SubmitIntentOutput:
+        serialize = getattr(self._sessions, "serialize", None)
+        if serialize is None:
+            return await self._handle_intent_inner(intent)
+        async with serialize(intent.shopping_session_id):
+            if self._runtime_checkpoints is None:
+                return await self._handle_intent_inner(intent)
+            return await self._handle_intent_checkpointed(intent)
+
+    async def _handle_intent_checkpointed(self, intent: SubmitIntentInput) -> SubmitIntentOutput:
+        store = self._runtime_checkpoints
+        if store is None:
+            return await self._handle_intent_inner(intent)
+        session_id = intent.shopping_session_id
+        holder_id = uuid.uuid4().hex
+        lease = await self._acquire_session_lease(store, intent.buyer_id, session_id, holder_id)
+
+        lease_lost = asyncio.Event()
+        owner_task = asyncio.current_task()
+        renewer = asyncio.create_task(
+            self._renew_session_lease(lease, owner_task, lease_lost),
+        )
+        try:
+            # Refresh the cross-process session snapshot only after taking the
+            # SQLite lease, then overlay a more recent in-progress turn snapshot.
+            await self._sessions.refresh(session_id)
+            task_id = intent.task_id or f"turn-{uuid.uuid4().hex}"
+            fingerprint = self._input_fingerprint(intent)
+            checkpoint = await store.begin_turn(
+                task_id,
+                intent.buyer_id,
+                session_id,
+                fingerprint,
+                lease.holder_id,
+                lease.fencing_token,
+            )
+            runtime_turn = _RuntimeTurn(
+                task_id=task_id,
+                owner_id=intent.buyer_id,
+                session_id=session_id,
+                input_fingerprint=fingerprint,
+                lease=lease,
+                lease_lost=lease_lost,
+                checkpoint=checkpoint,
+            )
+            if checkpoint.replay:
+                restore_json = checkpoint.session_snapshot_json or checkpoint.snapshot_json
+            else:
+                restore_json = checkpoint.snapshot_json or checkpoint.session_snapshot_json
+            if restore_json:
+                await self._sessions.restore_snapshot(session_id, restore_json)
+            if checkpoint.replay:
+                final_text = checkpoint.final_text or ""
+                self._bus.publish(session_id, "final.result", {"text": final_text})
+                return SubmitIntentOutput(session_id, final_text)
+            resume = checkpoint.state == "running" and checkpoint.snapshot_json is not None
+            return await self._handle_intent_inner(intent, runtime_turn, resume=resume)
+        finally:
+            renewer.cancel()
+            await asyncio.gather(renewer, return_exceptions=True)
+            await store.release_lease(
+                lease.owner_id, lease.session_id, lease.holder_id, lease.fencing_token,
+            )
+
+    @staticmethod
+    async def _acquire_session_lease(
+        store: RuntimeCheckpointStore,
+        owner_id: str,
+        session_id: str,
+        holder_id: str,
+    ) -> SessionLease:
+        """Wait for another process's turn to finish, or its lease to expire."""
+        poll_interval = max(0.01, min(0.1, store.lease_ttl_seconds / 3))
+        deadline = time.monotonic() + store.lease_wait_timeout_seconds
+        while True:
+            lease = await store.acquire_lease(owner_id, session_id, holder_id)
+            if lease is not None:
+                return lease
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"timed out waiting for session lease: {session_id}")
+            await asyncio.sleep(min(poll_interval, remaining))
+
+    async def _renew_session_lease(
+        self,
+        lease: SessionLease,
+        owner_task: Optional[asyncio.Task],
+        lease_lost: asyncio.Event,
+    ) -> None:
+        store = self._runtime_checkpoints
+        if store is None:
+            return
+        interval = max(0.01, store.lease_ttl_seconds / 3)
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                renewed = await store.renew_lease(
+                    lease.owner_id, lease.session_id, lease.holder_id, lease.fencing_token,
+                )
+            except Exception:
+                logger.exception("session lease renewal failed")
+                renewed = False
+            if not renewed:
+                lease_lost.set()
+                if owner_task is not None and not owner_task.done():
+                    owner_task.cancel()
+                return
+
+    @staticmethod
+    def _input_fingerprint(intent: SubmitIntentInput) -> str:
+        return intent.fingerprint()
+
+    async def _handle_intent_inner(
+        self,
+        intent: SubmitIntentInput,
+        runtime_turn: Optional[_RuntimeTurn] = None,
+        *,
+        resume: bool = False,
+    ) -> SubmitIntentOutput:
         session_id = intent.shopping_session_id
         snapshot = ShoppingContextSnapshot(
             shopping_session_id=session_id,
             buyer_id=intent.buyer_id,
             locale=intent.locale,
             currency=intent.currency,
+            approval_id=intent.approval_id,
+            task_id=intent.task_id,
+            permissions=tuple(sorted(intent.permissions)),
         )
         token = ShoppingContext.set(snapshot)
         started_at = time.monotonic()
@@ -159,18 +340,20 @@ class MainAgentOrchestrator:
             summary_before = agent.state.summary
             # 语义缓存：仅首轮（无历史上下文）且非写操作意图时尝试命中，命中则零模型调用
             has_history = bool(agent.state.context)
-            cached = await self._lookup_cache(intent, has_history)
+            cached = None if resume else await self._lookup_cache(intent, has_history)
             if cached is not None:
                 final_text = self._guard_final_text(session_id, cached)
+                await self._complete_runtime_turn(runtime_turn, agent, final_text)
                 self._bus.publish(session_id, "final.result", {"text": final_text})
                 return SubmitIntentOutput(shopping_session_id=session_id, final_text=final_text)
 
-            inputs = await self._build_inputs(intent, session_id)
+            inputs = [] if resume else await self._build_inputs(intent, session_id)
 
-            final_text = await self._reply_with_retry(session_id, agent, inputs)
+            final_text = await self._reply_with_retry(session_id, agent, inputs, runtime_turn)
             final_text = self._guard_final_text(session_id, final_text)
             await self._check_drift(session_id)
 
+            await self._complete_runtime_turn(runtime_turn, agent, final_text)
             self._publish_compression(session_id, agent, summary_before)
             self._bus.publish(session_id, "final.result", {"text": final_text})
             await self._remember_cache(intent, final_text, has_history)
@@ -181,8 +364,11 @@ class MainAgentOrchestrator:
             final_text = f"[error] {err}"
             return SubmitIntentOutput(shopping_session_id=session_id, final_text=final_text)
         finally:
-            # 无论成功失败都落盘会话状态（失败内部仅告警）
-            await self._sessions.persist(session_id)
+            # With runtime checkpoints, only safe native event boundaries and
+            # completed turns are persisted. Keep the legacy end-of-turn snapshot
+            # behavior when recovery storage is not configured.
+            if runtime_turn is None:
+                await self._sessions.persist(session_id)
             await self._record_conversation(
                 intent, final_text, int((time.monotonic() - started_at) * 1000), trace,
             )
@@ -297,12 +483,22 @@ class MainAgentOrchestrator:
         except Exception as err:  # noqa: BLE001
             logger.warning("对话记录写入失败：%s（%s）", session_id, err)
 
-    async def _reply_with_retry(self, session_id: str, agent: Agent, inputs: list[Msg]) -> str:
+    async def _reply_with_retry(
+        self,
+        session_id: str,
+        agent: Agent,
+        inputs: list[Msg],
+        runtime_turn: Optional[_RuntimeTurn] = None,
+    ) -> str:
         """跑一轮 Agent 并映射事件流；上游瞬时错误按指数退避重试。"""
+        if runtime_turn is not None:
+            # Gateway owns provider retries. Worker redelivery resumes checkpoints
+            # instead of adding another in-process retry multiplier.
+            return await self._consume_reply(session_id, agent, inputs, runtime_turn)
         last_error: Exception | None = None
         for attempt in range(_MAX_TURN_RETRIES + 1):
             try:
-                return await self._consume_reply(session_id, agent, inputs)
+                return await self._consume_reply(session_id, agent, inputs, runtime_turn)
             except Exception as err:  # noqa: BLE001
                 if not is_transient_error(err) or attempt >= _MAX_TURN_RETRIES:
                     raise
@@ -326,12 +522,20 @@ class MainAgentOrchestrator:
                 await asyncio.sleep(delay)
         raise last_error if last_error else RuntimeError("reply 重试耗尽")
 
-    async def _consume_reply(self, session_id: str, agent: Agent, inputs: list[Msg]) -> str:
+    async def _consume_reply(
+        self,
+        session_id: str,
+        agent: Agent,
+        inputs: list[Msg],
+        runtime_turn: Optional[_RuntimeTurn] = None,
+    ) -> str:
         final_text = ""
         # tool_call_id → 工具名，用于把 ToolResultEndEvent 关联回 Task 工具
         call_names: dict[str, str] = {}
         async for event in agent.reply_stream(inputs or None, yield_final_msg=True):
-            if isinstance(event, Msg):
+            if isinstance(event, ModelCallStartEvent):
+                await self._save_runtime_snapshot(runtime_turn, agent)
+            elif isinstance(event, Msg):
                 final_text = event.get_text_content() or ""
             elif isinstance(event, TextBlockDeltaEvent):
                 if event.delta:
@@ -347,7 +551,68 @@ class MainAgentOrchestrator:
                 if tool_name in _TASK_TOOL_NAMES:
                     self._bus.publish(session_id, "plan.update", _tasks_snapshot(agent))
                 self._observe_for_drift(session_id, tool_name, event)
+                if self._has_native_tool_result(agent, event.tool_call_id):
+                    await self._save_runtime_snapshot(runtime_turn, agent)
         return final_text
+
+    @staticmethod
+    def _has_native_tool_result(agent: Agent, tool_call_id: str) -> bool:
+        """Only checkpoint a ToolResultEndEvent after AgentScope saved its result."""
+        return any(
+            isinstance(block, ToolResultBlock) and block.id == tool_call_id
+            for message in agent.state.context
+            for block in (message.content or [])
+        )
+
+    async def _save_runtime_snapshot(
+        self, runtime_turn: Optional[_RuntimeTurn], agent: Agent,
+    ) -> None:
+        if runtime_turn is None:
+            return
+        if runtime_turn.lease_lost.is_set():
+            raise SessionLeaseLostError("session lease was lost during turn execution")
+        store = self._runtime_checkpoints
+        if store is None:
+            raise SessionLeaseLostError("runtime checkpoint store was removed during turn execution")
+        saved = await store.save_snapshot(
+            runtime_turn.task_id,
+            runtime_turn.owner_id,
+            runtime_turn.session_id,
+            runtime_turn.input_fingerprint,
+            runtime_turn.lease.holder_id,
+            runtime_turn.lease.fencing_token,
+            agent.state.model_dump_json(),
+        )
+        if not saved:
+            raise SessionLeaseLostError("fenced runtime snapshot write was rejected")
+        await self._sessions.persist(runtime_turn.session_id)
+
+    async def _complete_runtime_turn(
+        self,
+        runtime_turn: Optional[_RuntimeTurn],
+        agent: Agent,
+        final_text: str,
+    ) -> None:
+        if runtime_turn is None:
+            return
+        if runtime_turn.lease_lost.is_set():
+            raise SessionLeaseLostError("session lease was lost before turn completion")
+        store = self._runtime_checkpoints
+        if store is None:
+            raise SessionLeaseLostError("runtime checkpoint store was removed during turn execution")
+        completed = await store.complete_turn(
+            runtime_turn.task_id,
+            runtime_turn.owner_id,
+            runtime_turn.session_id,
+            runtime_turn.input_fingerprint,
+            runtime_turn.lease.holder_id,
+            runtime_turn.lease.fencing_token,
+            agent.state.model_dump_json(),
+            final_text,
+        )
+        if not completed:
+            raise SessionLeaseLostError("fenced runtime completion was rejected")
+        await self._sessions.persist(runtime_turn.session_id)
 
     def _observe_for_drift(self, session_id: str, tool_name: Optional[str], event: Any) -> None:
         """把一次工具结果记进漂移轨迹（开关关时零开销）。"""

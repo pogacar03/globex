@@ -28,6 +28,8 @@ from typing import Any
 TradeEventType = str
 
 EVENT_TYPES = (
+    "approval.required",
+    "runtime.checkpoint",
     "agent.dispatch",
     "tool.invoke",
     "tool.result",

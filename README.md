@@ -13,6 +13,8 @@
 
 设计取舍和阶段性记录见[设计演进文档](docs/设计演进记录.md)；待实现能力在对齐清单中单独列出。
 
+本次工程补强的分层、实现细节与未完成边界见 [运行时设计](docs/runtime-hardening.md)，实际命令、结果与日志见 [验收记录](docs/runtime-acceptance.md)。新增身份授权、参数绑定审批、原生任务快照、会话租约、Redis owner 原子检查、难度路由、MCP stdio 和离线 CI。完整自动晋级飞轮、生产交易存储与 OIDC 尚未实现。
+
 > **关于 Git 历史**：本仓库的代码来自 2026 年 5—8 月的实际开发。公开版本的提交历史是在整理
 > 公开仓库时重新生成的，提交信息中统一标注为 `reconstructed`，因此**提交时间不等于当时的真实开发时间**。
 > 此说明仅用于澄清历史的生成方式，代码内容与测试结果不受影响。
@@ -72,7 +74,7 @@ docker/                # docker-compose.yaml（app + worker + qdrant + redis + f
   SQLite（默认）/ JSON 文件两套实现共存，换存储只改 `app/composition.py`
 - **异步削峰**：`TaskQueue` 端口 + Redis Stream 实现（消费者组 / ack / pending 重投 / 死信），
   独立 worker 进程消费；`POST /commerce/intents` **同步语义不变**（内部入队+等结果），
-  另提供 `/commerce/intents/async` + `/commerce/tasks/{id}`；队列是 at-least-once，靠幂等键防重复下单
+  另提供 `/commerce/intents/async` + `/commerce/tasks/{id}`；队列是 at-least-once，turn 快照与审批回执控制重放，不确定的写操作停止自动重试
 - **跨进程事件**：worker 与 API 是两个进程，事件总线接 Redis Pub/Sub 背板后前端仍能收到流式事件；
   广播带 `origin` 标识以跳过自己发的消息（否则事件会回环投递两次）
 - **主 Agent 单干优先**：MainAgent 与子 Agent 持有同一批业务工具（`build_tools()` 复用），
@@ -103,8 +105,25 @@ docker/                # docker-compose.yaml（app + worker + qdrant + redis + f
 
 ## 启动
 
+先运行不依赖真实模型或商家数据的模式：
+
 ```bash
-uv sync
+uv sync --frozen --python 3.11
+uv run --frozen python scripts/dev_identity.py   # 一次生成 data/dev-identity.env，权限0600，不打印凭证
+source data/dev-identity.env                    # 每个API/Worker/客户端终端均需加载
+uv run --frozen uvicorn app.presentation.server:app --port 8000
+# 另一个终端启动前端（Node 22.22.2）
+cd frontend
+npm ci
+npm run dev
+```
+
+在浏览器访问令牌输入框中使用本地 `GLOBEX_ACCESS_TOKEN`。该身份文件只用于本地开发，位于忽略目录，不可提交或转发。脚本不会覆盖已有身份文件。配置 Redis 后可另起独立 Worker；API 与 Worker 必须共享 DATA_DIR、身份目录与模型配置。`scripts/accept_runtime.py` 会自动创建隔离数据目录、临时身份与 Redis，完成后清理进程和容器，不用人工管理端口。
+
+接真实服务时显式设置 live 和实际模型；当前云环境的 LLM/Langfuse 联通性不属于离线测试结论：
+
+```bash
+export LLM_MODE=live
 # 敏感配置通过环境变量注入（推荐），不落盘、不入库
 export LLM_BASE_URL=<OpenAI 兼容网关地址>
 export LLM_API_KEY=<密钥>
@@ -121,15 +140,22 @@ uv run python -m app.worker
 ## API 概览
 
 - `POST /commerce/intents` 提交买家自然语言意图（同步返回最终回复）
-- `WS   /commerce/events` 订阅会话事件流（连上后先发 `{"shopping_session_id": "..."}`）
+- `WS   /commerce/events` 订阅会话事件流（首帧含 `access_token` 与 `shopping_session_id`）
 - `GET  /commerce/orders/{order_id}` 查询订单
 - `POST /commerce/orders/{order_id}/cancel` 取消订单
 - `GET  /health` 健康检查
+- `GET /commerce/me` 当前受认证身份；commerce HTTP 接口均需 Bearer
+- `GET /commerce/approvals?shopping_session_id=...` 恢复持久审批卡片
+- `POST /commerce/approvals/{id}/approve` 人工批准准确参数
+- `POST /commerce/approvals/{id}/execute` 执行已批准的持久参数，返回真实业务回执；重复请求重放回执
+- 取消订单需会话和审批 ID；首次调用仅提出审批，不执行取消
+- MCP：`GLOBEX_API_URL=... uv run --frozen python -m app.presentation.mcp_server`，凭证从 `GLOBEX_ACCESS_TOKEN` 注入；research需启用Redis队列，立即返回task_id用于查询
 
 ## 验证
 
 ```bash
-uv run pytest                          # 137 个单测：domain / 召回降级与过滤回传 / 计价规则 / 记忆持久化 / 压缩策略 / 韧性中间件
+uv run --frozen pytest -q             # 原有291项及新增边界回归；实际计数见验收记录
+uv run --frozen python scripts/accept_runtime.py --benchmark  # 真实Redis、独立进程、kill/restart、WS、MCP、3次SYNTHETIC对照
 uv run python scripts/smoke_e2e.py    # 端到端冒烟：WS 订阅 + 提交意图，实时打印事件流
 uv run python scripts/verify_parallel.py   # 并行验证：同轮多派 vs 串行的墙钟耗时与事件重叠数对比
 uv run python scripts/eval_regression.py   # 评测回归：13 条 case，LLM judge 按 P0/P1/P2 Rubric 打分出报告
@@ -137,6 +163,8 @@ uv run python scripts/eval_regression.py   # 评测回归：13 条 case，LLM ju
 
 评测 case 支持 `prior_context` 字段：把跨会话已成立的事实（如上一 case 写入的长期偏好）告知 judge，
 否则 judge 只看本会话记录，会把"正确应用历史偏好"误判为"无据添加"。
+
+smoke、verify_parallel、loadtest、locust 和 eval_regression 均需当前 workspace 的 GLOBEX_ACCESS_TOKEN。真实 judge 回归还需 LLM 服务，单个 token 只代表一个真实身份，case 的 buyer_id 不能再伪装其他用户。此类线上回归尚未在本轮执行。
 
 ## Docker 部署
 

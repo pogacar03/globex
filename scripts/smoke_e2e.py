@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import uuid
 
 import httpx
@@ -24,7 +25,7 @@ WS_URL = "ws://127.0.0.1:8000/commerce/events"
 async def listen_events(session_id: str, stop: asyncio.Event) -> list[dict]:
     events: list[dict] = []
     async with websockets.connect(WS_URL) as ws:
-        await ws.send(json.dumps({"shopping_session_id": session_id}))
+        await ws.send(json.dumps({"shopping_session_id": session_id, "access_token": os.environ["GLOBEX_ACCESS_TOKEN"]}))
         while not stop.is_set():
             try:
                 raw = await asyncio.wait_for(ws.recv(), timeout=1)
@@ -55,12 +56,11 @@ async def main() -> None:
     listener = asyncio.create_task(listen_events(session_id, stop))
     await asyncio.sleep(0.5)  # 等 WS 订阅建立
 
-    async with httpx.AsyncClient(timeout=600) as client:
+    async with httpx.AsyncClient(timeout=600, headers={"Authorization": "Bearer " + os.environ["GLOBEX_ACCESS_TOKEN"]}) as client:
         response = await client.post(
             f"{BASE_URL}/commerce/intents",
             json={
                 "shopping_session_id": session_id,
-                "buyer_id": "buyer-001",
                 "locale": "zh-CN",
                 "currency": "CNY",
                 "raw_query": args.query,

@@ -7,6 +7,7 @@ const LABELS: Record<string, string> = {
   "plan.update": "任务清单",
   "context.compressed": "上下文压缩",
   "model.fallback": "模型回退",
+  "approval.required": "等待用户审批",
   "final.result": "最终回复",
   error: "异常",
 };
@@ -38,6 +39,8 @@ function summarize(event: TradeEvent): string {
       return `摘要 ${p.summary_length} 字，压缩后上下文 ${p.context_messages} 条`;
     case "model.fallback":
       return `${p.from} 限流，已改用 ${p.to}（${String(p.reason ?? "").slice(0, 40)}）`;
+    case "approval.required":
+      return `${p.tool ?? p.approval?.tool ?? "操作"}：${JSON.stringify(p.arguments ?? p.approval?.arguments ?? {}).slice(0, 160)}`;
     case "final.result":
       return String(p.text ?? "").slice(0, 60);
     case "error":

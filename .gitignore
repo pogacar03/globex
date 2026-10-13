@@ -15,6 +15,7 @@ data/
 frontend/node_modules/
 frontend/dist/
 frontend/*.tsbuildinfo
+artifacts/
 .idea/
 .vscode/
 eval/report-*.md
